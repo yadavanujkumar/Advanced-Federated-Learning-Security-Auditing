@@ -456,35 +456,58 @@ class VulnerableFedAvg(FedAvg):
 # ============================================================================
 # Client Generation Function
 # ============================================================================
+def _extract_client_id(context, num_clients: int) -> int:
+    """Extract client ID from Flower context with multiple fallback approaches.
+
+    Args:
+        context: Flower client context
+        num_clients: Total number of clients for modulo operation
+
+    Returns:
+        Client ID as integer
+    """
+    # Try getting partition-id from node_config (newer Flower API)
+    if hasattr(context, 'node_config') and context.node_config:
+        if 'partition-id' in context.node_config:
+            return int(context.node_config['partition-id'])
+
+    # Fallback to node_id if available
+    if hasattr(context, 'node_id'):
+        try:
+            return int(context.node_id) % num_clients
+        except (ValueError, TypeError):
+            pass
+
+    return -1  # Indicates fallback counter should be used
+
+
+class ClientIdCounter:
+    """Thread-safe counter for client ID assignment when context-based ID is unavailable."""
+
+    def __init__(self, num_clients: int):
+        self._count = 0
+        self._num_clients = num_clients
+
+    def next_id(self) -> int:
+        current = self._count
+        self._count = (self._count + 1) % self._num_clients
+        return current
+
+
 def client_fn_factory(
     trainloaders: List[DataLoader],
     valloader: DataLoader,
     malicious_clients: set
 ):
     """Factory function to create client_fn for Flower simulation."""
-    # Counter to track client instances when no ID is available
-    client_counter = [0]
+    counter = ClientIdCounter(NUM_CLIENTS)
 
     def client_fn(context) -> fl.client.Client:
-        # Get client ID from context using multiple fallback approaches
-        client_id = None
+        client_id = _extract_client_id(context, NUM_CLIENTS)
 
-        # Try getting partition-id from node_config (newer Flower API)
-        if hasattr(context, 'node_config') and context.node_config:
-            if 'partition-id' in context.node_config:
-                client_id = int(context.node_config['partition-id'])
-
-        # Fallback to node_id if available
-        if client_id is None and hasattr(context, 'node_id'):
-            try:
-                client_id = int(context.node_id) % NUM_CLIENTS
-            except (ValueError, TypeError):
-                pass
-
-        # Final fallback: use counter-based assignment
-        if client_id is None:
-            client_id = client_counter[0]
-            client_counter[0] = (client_counter[0] + 1) % NUM_CLIENTS
+        # Use counter as fallback if context-based extraction failed
+        if client_id < 0:
+            client_id = counter.next_id()
 
         is_malicious = client_id in malicious_clients
         return FlowerClient(
@@ -510,10 +533,13 @@ def get_evaluate_fn(testloader: DataLoader):
     ) -> Optional[Tuple[float, Dict[str, Scalar]]]:
         net = SimpleCNN().to(DEVICE)
         # Handle both List[np.ndarray] (newer API) and Parameters object (older API)
-        if hasattr(parameters, 'tensors'):
+        if isinstance(parameters, Parameters):
             params = parameters_to_ndarrays(parameters)
-        else:
+        elif isinstance(parameters, list):
             params = parameters
+        else:
+            # Try to convert using hasattr as last resort for duck typing
+            params = parameters_to_ndarrays(parameters) if hasattr(parameters, 'tensors') else parameters
         set_parameters(net, params)
         loss, accuracy = test(net, testloader, DEVICE)
         print(f"  Round {server_round}: Global model accuracy = {accuracy:.4f}")
