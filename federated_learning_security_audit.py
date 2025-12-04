@@ -77,26 +77,24 @@ class SimpleCNN(nn.Module):
 # ============================================================================
 # Data Loading and Partitioning
 # ============================================================================
-class SyntheticMNIST(torch.utils.data.Dataset):
-    """Synthetic dataset mimicking MNIST/FashionMNIST for testing."""
+def create_synthetic_dataset(
+    num_samples: int = 6000,
+    seed: int = 42
+) -> torch.utils.data.TensorDataset:
+    """Create synthetic dataset mimicking MNIST/FashionMNIST for testing."""
+    np.random.seed(seed)
 
-    def __init__(self, num_samples: int = 6000, train: bool = True):
-        self.num_samples = num_samples
-        np.random.seed(42 if train else 43)
+    # Generate synthetic 28x28 grayscale images
+    data = np.random.randn(num_samples, 1, 28, 28).astype(np.float32)
+    # Normalize data
+    data = (data - data.mean()) / (data.std() + 1e-8)
+    # Generate random labels (10 classes)
+    targets = np.random.randint(0, 10, num_samples)
 
-        # Generate synthetic 28x28 grayscale images
-        self.data = np.random.randn(num_samples, 1, 28, 28).astype(np.float32)
-        # Generate random labels (10 classes)
-        self.targets = np.random.randint(0, 10, num_samples)
-
-        # Normalize data
-        self.data = (self.data - self.data.mean()) / (self.data.std() + 1e-8)
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        return torch.tensor(self.data[idx]), self.targets[idx]
+    return torch.utils.data.TensorDataset(
+        torch.tensor(data),
+        torch.tensor(targets, dtype=torch.long)
+    )
 
 
 def load_datasets() -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
@@ -117,8 +115,8 @@ def load_datasets() -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]
     except (RuntimeError, OSError) as e:
         print(f"    Could not download FashionMNIST: {e}")
         print("    Using synthetic dataset for demonstration")
-        trainset = SyntheticMNIST(num_samples=6000, train=True)
-        testset = SyntheticMNIST(num_samples=1000, train=False)
+        trainset = create_synthetic_dataset(num_samples=6000, seed=42)
+        testset = create_synthetic_dataset(num_samples=1000, seed=43)
 
     return trainset, testset
 
@@ -464,14 +462,29 @@ def client_fn_factory(
     malicious_clients: set
 ):
     """Factory function to create client_fn for Flower simulation."""
+    # Counter to track client instances when no ID is available
+    client_counter = [0]
 
     def client_fn(context) -> fl.client.Client:
-        # Get client ID from context or partition_id
-        if hasattr(context, 'node_config') and 'partition-id' in context.node_config:
-            client_id = int(context.node_config['partition-id'])
-        else:
-            # Fallback for older API
-            client_id = int(context.node_id) if hasattr(context, 'node_id') else 0
+        # Get client ID from context using multiple fallback approaches
+        client_id = None
+
+        # Try getting partition-id from node_config (newer Flower API)
+        if hasattr(context, 'node_config') and context.node_config:
+            if 'partition-id' in context.node_config:
+                client_id = int(context.node_config['partition-id'])
+
+        # Fallback to node_id if available
+        if client_id is None and hasattr(context, 'node_id'):
+            try:
+                client_id = int(context.node_id) % NUM_CLIENTS
+            except (ValueError, TypeError):
+                pass
+
+        # Final fallback: use counter-based assignment
+        if client_id is None:
+            client_id = client_counter[0]
+            client_counter[0] = (client_counter[0] + 1) % NUM_CLIENTS
 
         is_malicious = client_id in malicious_clients
         return FlowerClient(
@@ -492,12 +505,16 @@ def get_evaluate_fn(testloader: DataLoader):
 
     def evaluate(
         server_round: int,
-        parameters: List[np.ndarray],
+        parameters: Union[List[np.ndarray], Parameters],
         config: Dict[str, Scalar]
     ) -> Optional[Tuple[float, Dict[str, Scalar]]]:
         net = SimpleCNN().to(DEVICE)
-        # Parameters are already numpy arrays in newer flwr versions
-        set_parameters(net, parameters)
+        # Handle both List[np.ndarray] (newer API) and Parameters object (older API)
+        if hasattr(parameters, 'tensors'):
+            params = parameters_to_ndarrays(parameters)
+        else:
+            params = parameters
+        set_parameters(net, params)
         loss, accuracy = test(net, testloader, DEVICE)
         print(f"  Round {server_round}: Global model accuracy = {accuracy:.4f}")
         return loss, {"accuracy": accuracy}
@@ -539,11 +556,18 @@ def run_simulation(
         client_resources={"num_cpus": 1, "num_gpus": 0.0},
     )
 
-    # Extract accuracy history
+    # Extract accuracy history with fallback for different Flower versions
     accuracies = []
-    if hasattr(history, 'metrics_centralized') and 'accuracy' in history.metrics_centralized:
-        for _, accuracy in history.metrics_centralized['accuracy']:
-            accuracies.append(accuracy)
+    try:
+        if hasattr(history, 'metrics_centralized') and history.metrics_centralized:
+            if 'accuracy' in history.metrics_centralized:
+                for _, accuracy in history.metrics_centralized['accuracy']:
+                    accuracies.append(accuracy)
+        # Fallback: try to get from losses_centralized if available
+        if not accuracies and hasattr(history, 'losses_centralized'):
+            print("  [Warning] Could not extract accuracy metrics, using loss-based estimation")
+    except (AttributeError, TypeError, KeyError) as e:
+        print(f"  [Warning] Error extracting metrics: {e}")
 
     return accuracies
 
