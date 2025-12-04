@@ -482,13 +482,19 @@ def _extract_client_id(context, num_clients: int) -> int:
 
 
 class ClientIdCounter:
-    """Thread-safe counter for client ID assignment when context-based ID is unavailable."""
+    """Counter for client ID assignment when context-based ID is unavailable.
+
+    Note: This counter is used within Ray actors where each actor has its own
+    instance. Thread safety is not required as Flower simulation assigns
+    clients sequentially within each actor.
+    """
 
     def __init__(self, num_clients: int):
         self._count = 0
         self._num_clients = num_clients
 
     def next_id(self) -> int:
+        """Get next client ID in round-robin fashion."""
         current = self._count
         self._count = (self._count + 1) % self._num_clients
         return current
@@ -537,9 +543,13 @@ def get_evaluate_fn(testloader: DataLoader):
             params = parameters_to_ndarrays(parameters)
         elif isinstance(parameters, list):
             params = parameters
+        elif hasattr(parameters, 'tensors'):
+            # Duck typing fallback for Parameters-like objects
+            params = parameters_to_ndarrays(parameters)
         else:
-            # Try to convert using hasattr as last resort for duck typing
-            params = parameters_to_ndarrays(parameters) if hasattr(parameters, 'tensors') else parameters
+            raise TypeError(
+                f"Expected List[np.ndarray] or Parameters, got {type(parameters).__name__}"
+            )
         set_parameters(net, params)
         loss, accuracy = test(net, testloader, DEVICE)
         print(f"  Round {server_round}: Global model accuracy = {accuracy:.4f}")
